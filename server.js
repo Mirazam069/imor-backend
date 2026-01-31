@@ -1,8 +1,8 @@
+// server.js
 const express = require("express");
 const cors = require("cors");
-const path = require("path");
-const fs = require("fs");
 const multer = require("multer");
+const crypto = require("crypto");
 
 // dotenv birinchi yuklansin
 require("dotenv").config();
@@ -10,43 +10,64 @@ require("dotenv").config();
 // db pool
 const pool = require("./db");
 
+// AWS S3 compatible (R2) SDK
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
+
 const app = express();
+
+// ✅ Render/Proxy ortida protocol/headerlar to‘g‘ri o‘qilishi uchun
+app.set("trust proxy", 1);
 
 /* =========================
    MIDDLEWARES
 ========================= */
 app.use(
   cors({
-    origin: true, // devda hammasiga ruxsat
+    origin: true, // dev/prodda kelgan origin’ni qaytaradi
     credentials: true,
   })
 );
 app.use(express.json({ limit: "2mb" }));
 
 /* =========================
-   Uploads (REAL)
+   R2 (S3-compatible)
 ========================= */
 
-// uploads papka yo‘q bo‘lsa yaratib qo‘yamiz
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const R2_ACCOUNT_ID = process.env.R2_ACCOUNT_ID || "";
+const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
+const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
+const R2_BUCKET = process.env.R2_BUCKET || "imor-uploads";
+
+// ✅ Asosiy env nomi: R2_PUBLIC_BASE_URL
+// ✅ Fallback: R2_PUBLIC_BASE
+const R2_PUBLIC_BASE_URL = String(
+  process.env.R2_PUBLIC_URL ||          // ✅ Render’da bor
+  process.env.R2_PUBLIC_BASE_URL ||     // optional
+  process.env.R2_PUBLIC_BASE ||         // optional
+  "https://pub-1eba283b4eb44ecbbb9af8ab84fddca2.r2.dev"
+).replace(/\/+$/, "");
+
+// ✅ credential bor/yo‘qligini flag qilib olamiz
+const R2_READY = Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY);
+
+if (!R2_READY) {
+  console.warn("[R2] Credentials yo‘q. Render ENV ga R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY ni qo‘ying.");
 }
 
-// ✅ static serve: /uploads/xxx.jpg orqali rasm ochiladi
-// ⚠️ faqat bitta marta yoziladi!
-app.use("/uploads", express.static(UPLOAD_DIR));
+// client faqat credential bo‘lsa ishlaydi
+const s3 = new S3Client({
+  region: "auto",
+  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: R2_ACCESS_KEY_ID,
+    secretAccessKey: R2_SECRET_ACCESS_KEY,
+  },
+});
 
-// (ixtiyoriy) agar no-photo.png yo‘q bo‘lsa — yaratib qo‘yamiz (minimal placeholder)
-const NO_PHOTO_PATH = path.join(UPLOAD_DIR, "no-photo.png");
-if (!fs.existsSync(NO_PHOTO_PATH)) {
-  // 1x1 px PNG (base64) — juda kichik placeholder
-  const tinyPngBase64 =
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/1m9bXcAAAAASUVORK5CYII=";
-  fs.writeFileSync(NO_PHOTO_PATH, Buffer.from(tinyPngBase64, "base64"));
-}
+/* =========================
+   Upload (RAM -> R2)
+========================= */
 
-// fayl nomini xavfsiz qilish
 function safeName(s) {
   return String(s || "")
     .toLowerCase()
@@ -55,40 +76,56 @@ function safeName(s) {
     .slice(0, 60);
 }
 
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase() || ".jpg";
-    const base = safeName(path.basename(file.originalname || "image", ext));
-    const uniq = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    cb(null, `${base}-${uniq}${ext}`);
+const upload = multer({
+  storage: multer.memoryStorage(), // ✅ disk emas
+  limits: { fileSize: 4 * 1024 * 1024 }, // 4MB
+  fileFilter(req, file, cb) {
+    const ok = ["image/jpeg", "image/png", "image/webp", "image/jpg"].includes(file.mimetype);
+    if (!ok) return cb(new Error("Faqat JPG/PNG/WEBP ruxsat."), false);
+    cb(null, true);
   },
 });
 
-function fileFilter(req, file, cb) {
-  const ok = ["image/jpeg", "image/png", "image/webp", "image/jpg"].includes(
-    file.mimetype
-  );
-  if (!ok) return cb(new Error("Faqat JPG/PNG/WEBP ruxsat."), false);
-  cb(null, true);
-}
-
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: { fileSize: 4 * 1024 * 1024 }, // 4MB
-});
-
-// ✅ upload endpoint: file -> { ok:true, url:"/uploads/xxx.jpg" }
-app.post("/upload", upload.single("file"), (req, res) => {
+// ✅ upload endpoint: file -> { ok:true, url:"https://...r2.dev/<key>" }
+app.post("/upload", upload.single("file"), async (req, res) => {
   try {
+    if (!R2_READY) {
+      return res.status(500).json({
+        ok: false,
+        error: "R2 sozlanmagan. Render ENV’da R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY yo‘q.",
+      });
+    }
+
     if (!req.file) return res.status(400).json({ ok: false, error: "Fayl topilmadi." });
 
-    const base = `${req.protocol}://${req.get("host")}`; // ✅ https://imor-backend.onrender.com
-    const url = `${base}/uploads/${req.file.filename}`;
+    const extFromMime = {
+      "image/jpeg": ".jpg",
+      "image/jpg": ".jpg",
+      "image/png": ".png",
+      "image/webp": ".webp",
+    };
 
-    return res.status(201).json({ ok: true, url });
+    const original = req.file.originalname || "image";
+    const base = safeName(original.replace(/\.[^/.]+$/, ""));
+    const ext = extFromMime[req.file.mimetype] || ".jpg";
+    const uniq = crypto.randomBytes(8).toString("hex");
+
+    // ✅ tartib uchun folder bilan saqlaymiz
+    const key = `imor/${base}-${Date.now()}-${uniq}${ext}`;
+
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: key,
+        Body: req.file.buffer,
+        ContentType: req.file.mimetype,
+      })
+    );
+
+    const url = `${R2_PUBLIC_BASE_URL}/${key}`;
+    return res.status(201).json({ ok: true, url, key });
   } catch (e) {
+    console.error("[UPLOAD ERROR]", e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
@@ -97,32 +134,20 @@ app.post("/upload", upload.single("file"), (req, res) => {
    Helpers
 ========================= */
 
-// ✅ Lokal placeholder
-const DEFAULT_IMAGE_URL = "/uploads/no-photo.png";
+// R2’da default rasm bo‘lsa shu yerga qo‘yasan, hozir bo‘sh qoldiramiz
+const DEFAULT_IMAGE_URL = "";
 
-/**
- * image_url ni tozalash:
- * - base64 data:image... bo‘lsa DBga yozmaymiz
- * - bo‘sh bo‘lsa default
- */
+// base64 kelib qolsa — DBga yozmaymiz
 function sanitizeImageUrl(image_url) {
   let img = image_url || null;
 
   if (typeof img === "string") {
     const s = img.trim();
-
-    // base64 bo‘lsa — DBni shishirmaymiz
-    if (s.startsWith("data:image")) return DEFAULT_IMAGE_URL;
-
-    // bo‘sh bo‘lsa
     if (!s) return DEFAULT_IMAGE_URL;
 
-    // agar user faqat "rasm.jpg" yuborsa, uni /uploads/ ga o‘rab qo‘yamiz (xatoni kamaytiradi)
-    if (!s.startsWith("http") && !s.startsWith("/uploads/") && !s.startsWith("/")) {
-      return `/uploads/${s}`;
-    }
+    if (s.startsWith("data:image")) return DEFAULT_IMAGE_URL;
 
-    return s;
+    return s; // ✅ endi URLlar absolute bo‘ladi (r2.dev)
   }
 
   return DEFAULT_IMAGE_URL;
@@ -133,7 +158,15 @@ function sanitizeImageUrl(image_url) {
 ========================= */
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true, app: "imor-backend" });
+  res.json({
+    ok: true,
+    app: "imor-backend",
+    r2: {
+      ready: R2_READY,
+      bucket: R2_BUCKET,
+      publicBase: R2_PUBLIC_BASE_URL,
+    },
+  });
 });
 
 app.get("/db-test", async (req, res) => {
@@ -159,7 +192,6 @@ app.get("/db-info", async (req, res) => {
    PRODUCTS
 ========================= */
 
-// (oddiy) list
 app.get("/products", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM products ORDER BY created_at DESC");
@@ -169,7 +201,6 @@ app.get("/products", async (req, res) => {
   }
 });
 
-// by id
 app.get("/products/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -184,7 +215,6 @@ app.get("/products/:id", async (req, res) => {
   }
 });
 
-// create
 app.post("/products", async (req, res) => {
   try {
     const {
@@ -253,7 +283,6 @@ app.post("/products", async (req, res) => {
   }
 });
 
-// update
 app.put("/products/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -332,7 +361,6 @@ app.put("/products/:id", async (req, res) => {
   }
 });
 
-// delete
 app.delete("/products/:id", async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -354,5 +382,5 @@ app.delete("/products/:id", async (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log("IMOR backend running on port", PORT);
-  console.log("Uploads served at: http://localhost:" + PORT + "/uploads/<file>");
+  console.log("R2 READY:", R2_READY, "| BUCKET:", R2_BUCKET);
 });
