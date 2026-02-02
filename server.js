@@ -23,7 +23,7 @@ app.set("trust proxy", 1);
 ========================= */
 app.use(
   cors({
-    origin: true, // dev/prodda kelgan origin’ni qaytaradi
+    origin: true,
     credentials: true,
   })
 );
@@ -38,30 +38,41 @@ const R2_ACCESS_KEY_ID = process.env.R2_ACCESS_KEY_ID || "";
 const R2_SECRET_ACCESS_KEY = process.env.R2_SECRET_ACCESS_KEY || "";
 const R2_BUCKET = process.env.R2_BUCKET || "imor-uploads";
 
-// ✅ Asosiy env nomi: R2_PUBLIC_BASE_URL
-// ✅ Fallback: R2_PUBLIC_BASE
+// ✅ Public base URL'ni faqat ENV’dan oling (xato account'ga fallback qilib yubormaslik uchun)
+// Tavsiya: Render ENV -> R2_PUBLIC_BASE_URL=https://pub-XXXX.r2.dev
 const R2_PUBLIC_BASE_URL = String(
-  process.env.R2_PUBLIC_URL ||          // ✅ Render’da bor
-  process.env.R2_PUBLIC_BASE_URL ||     // optional
-  process.env.R2_PUBLIC_BASE ||         // optional
-  "https://pub-1eba283b4eb44ecbbb9af8ab84fddca2.r2.dev"
+  process.env.R2_PUBLIC_BASE_URL ||
+    process.env.R2_PUBLIC_URL || // agar siz shuni ishlatgan bo‘lsangiz
+    process.env.R2_PUBLIC_BASE ||
+    ""
 ).replace(/\/+$/, "");
 
 // ✅ credential bor/yo‘qligini flag qilib olamiz
-const R2_READY = Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY);
+const R2_READY = Boolean(R2_ACCOUNT_ID && R2_ACCESS_KEY_ID && R2_SECRET_ACCESS_KEY && R2_PUBLIC_BASE_URL);
 
 if (!R2_READY) {
-  console.warn("[R2] Credentials yo‘q. Render ENV ga R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY ni qo‘ying.");
+  console.warn(
+    "[R2] ENV yetishmayapti. Kerak: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_PUBLIC_BASE_URL"
+  );
 }
 
-// client faqat credential bo‘lsa ishlaydi
+// ✅ R2 endpoint (S3 compatible) — backend uchun
+const R2_ENDPOINT = `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
+
+// ✅ client
 const s3 = new S3Client({
   region: "auto",
-  endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  endpoint: R2_ENDPOINT,
   credentials: {
     accessKeyId: R2_ACCESS_KEY_ID,
     secretAccessKey: R2_SECRET_ACCESS_KEY,
   },
+
+  // ✅ MUHIM: R2’da ko‘p muhitlarda muammoni yo‘qotadi (handshake/host style)
+  forcePathStyle: true,
+
+  // (ixtiyoriy) retrylar:
+  // maxAttempts: 3,
 });
 
 /* =========================
@@ -77,7 +88,7 @@ function safeName(s) {
 }
 
 const upload = multer({
-  storage: multer.memoryStorage(), // ✅ disk emas
+  storage: multer.memoryStorage(),
   limits: { fileSize: 4 * 1024 * 1024 }, // 4MB
   fileFilter(req, file, cb) {
     const ok = ["image/jpeg", "image/png", "image/webp", "image/jpg"].includes(file.mimetype);
@@ -92,7 +103,8 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     if (!R2_READY) {
       return res.status(500).json({
         ok: false,
-        error: "R2 sozlanmagan. Render ENV’da R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY yo‘q.",
+        error:
+          "R2 sozlanmagan. Render ENV’da R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY / R2_PUBLIC_BASE_URL yo‘q.",
       });
     }
 
@@ -126,7 +138,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     return res.status(201).json({ ok: true, url, key });
   } catch (e) {
     console.error("[UPLOAD ERROR]", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: e?.message || "Upload error" });
   }
 });
 
@@ -134,20 +146,16 @@ app.post("/upload", upload.single("file"), async (req, res) => {
    Helpers
 ========================= */
 
-// R2’da default rasm bo‘lsa shu yerga qo‘yasan, hozir bo‘sh qoldiramiz
 const DEFAULT_IMAGE_URL = "";
 
-// base64 kelib qolsa — DBga yozmaymiz
 function sanitizeImageUrl(image_url) {
   let img = image_url || null;
 
   if (typeof img === "string") {
     const s = img.trim();
     if (!s) return DEFAULT_IMAGE_URL;
-
     if (s.startsWith("data:image")) return DEFAULT_IMAGE_URL;
-
-    return s; // ✅ endi URLlar absolute bo‘ladi (r2.dev)
+    return s;
   }
 
   return DEFAULT_IMAGE_URL;
@@ -165,6 +173,7 @@ app.get("/health", (req, res) => {
       ready: R2_READY,
       bucket: R2_BUCKET,
       publicBase: R2_PUBLIC_BASE_URL,
+      endpoint: R2_ENDPOINT,
     },
   });
 });
@@ -383,4 +392,6 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log("IMOR backend running on port", PORT);
   console.log("R2 READY:", R2_READY, "| BUCKET:", R2_BUCKET);
+  console.log("R2 ENDPOINT:", R2_ENDPOINT);
+  console.log("R2 PUBLIC:", R2_PUBLIC_BASE_URL);
 });
